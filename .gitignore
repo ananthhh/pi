@@ -1,0 +1,13 @@
+# Secrets and runtime state
+auth.json
+sessions/
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Keep global pi customizations trackable:
+# skills/
+# extensions/
+# settings.json
