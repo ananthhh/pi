@@ -1,7 +1,7 @@
 /**
  * Tokens-per-second display extension for pi.
  *
- * Shows live estimated tokens/sec during assistant streaming,
+ * Shows live estimated tokens/sec in the working indicator during assistant streaming,
  * then switches to exact tokens/sec when the message completes.
  *
  * Place in ~/.pi/agent/extensions/ (global) or .pi/extensions/ (project-local).
@@ -40,12 +40,14 @@ export default function (pi: ExtensionAPI) {
 		estimatedTokens = 0;
 		clearLiveTimer();
 
-		// Update status every 200ms while streaming
+		ctx.ui.setWorkingMessage("0.0 tok/s (est)");
+
+		// Replace the default "Working..." message every 200ms while streaming.
 		liveTimer = setInterval(() => {
 			if (!startTime) return;
 			const elapsed = (Date.now() - startTime) / 1000;
 			const tps = elapsed > 0 ? estimatedTokens / elapsed : 0;
-			ctx.ui.setStatus("tps", `⚡ ${tps.toFixed(1)} tok/s (est)`);
+			ctx.ui.setWorkingMessage(`${tps.toFixed(1)} tok/s (est)`);
 		}, 200);
 	});
 
@@ -65,14 +67,22 @@ export default function (pi: ExtensionAPI) {
 		const outputTokens = msg.usage.output;
 		const tps = elapsed > 0 ? outputTokens / elapsed : 0;
 
-		const status = `⚡ ${tps.toFixed(1)} tok/s  ·  ${outputTokens} tokens  ·  ${elapsed.toFixed(1)}s`;
-		ctx.ui.setStatus("tps", status);
+		ctx.ui.setWorkingMessage(`${tps.toFixed(1)} tok/s  ·  ${outputTokens} tokens  ·  ${elapsed.toFixed(1)}s`);
+
+		// Clear the old footer/status entry if a previous version of this extension set it.
+		ctx.ui.setStatus("tps", undefined);
 
 		startTime = null;
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("agent_end", async (_event, ctx) => {
+		ctx.ui.setWorkingMessage(undefined);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
 		clearLiveTimer();
+		ctx.ui.setWorkingMessage(undefined);
+		ctx.ui.setStatus("tps", undefined);
 		startTime = null;
 	});
 }
