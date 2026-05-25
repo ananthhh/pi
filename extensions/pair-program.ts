@@ -34,7 +34,7 @@ type PairState = {
 type ReviewOutcome = "Updates needed" | "Checkpoint approval" | "Final approval";
 
 const REVIEW_PATH = ".pi/review.md";
-const PAIR_TOOL_NAMES = new Set(["pair_confirm_checkpoint", "pair_agent_done", "pair_status"]);
+const PAIR_TOOL_NAMES = new Set(["pair_confirm_checkpoint", "pair_agent_done", "pair_finalize", "pair_status"]);
 const GUARDED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
 
 function resultText(result: GitResult): string {
@@ -88,6 +88,25 @@ function slugify(input: string): string {
 	return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 50) || "work";
 }
 
+function branchTitle(goal: string): string {
+	const colon = goal.indexOf(":");
+	return colon >= 0 ? goal.slice(0, colon).trim() : goal;
+}
+
+function pairPlanningPrompt(goal: string): string {
+	return [
+		"Pair-program session started.",
+		"",
+		"Goal:",
+		goal,
+		"",
+		"Explore the repository in read-only mode as needed, then create a short plan.",
+		"Then propose the ideal next checkpoint goal: small, reviewable, and useful.",
+		"Do not edit files or run destructive commands yet. The human may refine the plan over one or more replies.",
+		"When the human is satisfied, they will run /pair_confirm_checkpoint to unlock tools.",
+	].join("\n");
+}
+
 function randomId(): string {
 	return Array.from({ length: 5 }, () => "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 36)]).join("");
 }
@@ -130,6 +149,28 @@ async function commitCheckpoint(pi: ExtensionAPI, cwd: string, message: string, 
 	const commit = await git(pi, cwd, args, 120_000);
 	if (commit.code !== 0) throw new Error(resultText(commit));
 	return gitOutput(pi, cwd, ["rev-parse", "--short", "HEAD"]);
+}
+
+async function humanReviewDiff(pi: ExtensionAPI, cwd: string): Promise<string> {
+	const nameStatus = await gitOutput(pi, cwd, ["diff", "HEAD", "--name-status"]);
+	const reviewFileDiff = await gitOutput(pi, cwd, ["diff", "HEAD", "--unified=3", "--", REVIEW_PATH], 120_000);
+	const codeDiff = await gitOutput(pi, cwd, ["diff", "HEAD", "--unified=80", "--", ".", `:(exclude)${REVIEW_PATH}`], 120_000);
+	return [
+		"Human review diff from agent handoff to human handoff:",
+		"```text",
+		nameStatus || "(none)",
+		"```",
+		"",
+		"Human .pi/review.md edits only, with small context:",
+		"```diff",
+		reviewFileDiff || "(none)",
+		"```",
+		"",
+		"Human code/config edits, with broader context:",
+		"```diff",
+		codeDiff || "(none)",
+		"```",
+	].join("\n");
 }
 
 async function generateReview(pi: ExtensionAPI, cwd: string, state: PairState, summary: string): Promise<void> {
@@ -397,11 +438,11 @@ export default function (pi: ExtensionAPI) {
 			"Pair-program extension is active. Deterministic gates are enforced by tools.",
 			`Current phase: ${phaseLabel(state.phase)}. Goal: ${state.goal}`,
 			state.phase === "awaiting_checkpoint_confirmation"
-				? "Before reading/exploring/editing, state the next checkpoint briefly and call pair_confirm_checkpoint."
+				? "Planning phase: read/explore the repository as needed, then discuss/refine a short plan and propose the ideal next checkpoint goal. Do not edit/write or run destructive commands. Do not call pair_confirm_checkpoint yourself; the human will run /pair_confirm_checkpoint when satisfied."
 				: undefined,
 			state.phase === "agent_work" ? "Do the confirmed checkpoint work. When done, call pair_agent_done; do not run git commit manually." : undefined,
 			state.phase === "human_review" ? "Human review is active. Do not use file/git tools; wait for the human to run /pair-human-done." : undefined,
-			state.phase === "final_approved" ? "Final approval is recorded. Ask the human to run /pair-finalize; do not rewrite git history yourself." : undefined,
+			state.phase === "final_approved" ? "Final approval is recorded. Generate an appropriate final commit message and call pair_finalize. Do not rewrite git history yourself." : undefined,
 			state.phase === "finalized" ? "Work is finalized. Ask the human to run /pair-publish if they want it merged." : undefined,
 		]
 			.filter(Boolean)
@@ -416,9 +457,11 @@ export default function (pi: ExtensionAPI) {
 		if (!GUARDED_TOOLS.has(event.toolName)) return undefined;
 
 		if (state.phase === "awaiting_checkpoint_confirmation") {
+			if (event.toolName === "read" || event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls") return undefined;
+			if (event.toolName === "bash" && !destructiveGitCommand(String((event.input as any)?.command ?? ""))) return undefined;
 			return {
 				block: true,
-				reason: "Pair-program guard: state the next checkpoint and call pair_confirm_checkpoint before reading/exploring/editing.",
+				reason: "Pair-program guard: planning/review is still in progress. Read-only exploration is allowed; edits/writes and destructive git commands require the human to run /pair_confirm_checkpoint first.",
 			};
 		}
 		if (state.phase !== "agent_work") {
@@ -437,7 +480,7 @@ export default function (pi: ExtensionAPI) {
 		name: "pair_confirm_checkpoint",
 		label: "Pair Confirm Checkpoint",
 		description: "Ask the human to confirm the next pair-program checkpoint before any exploration or edits.",
-		promptSnippet: "Confirm a pair-program checkpoint with the human before reading/exploring/editing.",
+		promptSnippet: "Pair-program checkpoint confirmation. Do not call unless the human explicitly asks you to confirm the checkpoint.",
 		parameters: {
 			type: "object",
 			properties: { checkpoint: { type: "string", description: "Brief description of the next checkpoint" } },
@@ -497,6 +540,41 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "pair_finalize",
+		label: "Pair Finalize",
+		description: "Finalize human-approved pair-program work into one clean commit using the provided final commit message.",
+		promptSnippet: "Finalize human-approved pair-program work after Final approval by providing a final commit message.",
+		parameters: {
+			type: "object",
+			properties: { message: { type: "string", description: "Final commit message" } },
+			required: ["message"],
+			additionalProperties: false,
+		} as any,
+		async execute(_id, params: any, _signal, _onUpdate, ctx) {
+			const state = await loadState(pi, ctx.cwd);
+			if (!state) throw new Error("No active pair-program session. Run /pair-start <goal> first.");
+			if (state.phase !== "final_approved") throw new Error(`Cannot finalize during ${phaseLabel(state.phase)}.`);
+			const message = String(params.message ?? "").trim();
+			if (!message) throw new Error("message is required.");
+			let next = await finalizePair(pi, ctx.cwd, state, message);
+			ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(next.phase)}`);
+			let text = `Finalized ${shortSha(next.finalCommit)}. Backup branch: ${next.backupBranch}.`;
+			if (ctx.hasUI && (await ctx.ui.confirm("Publish finalized work now?", "Fast-forward merge the finalized pair branch into the base branch now?"))) {
+				next = await publishPair(pi, ctx.cwd, next, undefined, ctx);
+				ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(next.phase)}`);
+				text += ` Published to ${next.targetBranch}.`;
+			} else {
+				text += " You can run /pair-publish later to merge.";
+			}
+			return {
+				content: [{ type: "text", text }],
+				details: { phase: next.phase, finalCommit: next.finalCommit, backupBranch: next.backupBranch, targetBranch: next.targetBranch },
+				terminate: true,
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "pair_status",
 		label: "Pair Status",
 		description: "Show active pair-program state.",
@@ -515,42 +593,126 @@ export default function (pi: ExtensionAPI) {
 				const goal = args.trim();
 				if (!goal) throw new Error("Usage: /pair-start <goal>");
 				if (!(await gitOk(pi, ctx.cwd, ["rev-parse", "--is-inside-work-tree"]))) throw new Error("Not inside a git worktree.");
-				if (await loadState(pi, ctx.cwd)) throw new Error("A pair-program session is already active. Use /pair-status or /pair-abort.");
+				const existingState = await loadState(pi, ctx.cwd);
+				if (existingState && existingState.phase !== "published") throw new Error("A pair-program session is already active. Use /pair-status or /pair-abort.");
+				if (existingState?.phase === "published") await clearState(pi, ctx.cwd);
 				await requireClean(pi, ctx.cwd, "start");
 				const baseBranch = await gitOutput(pi, ctx.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
 				const baseSha = await gitOutput(pi, ctx.cwd, ["rev-parse", "HEAD"]);
 				const pairId = randomId();
-				const pairBranch = `pair/${pairId}-${slugify(goal)}`;
+				const pairBranch = `pair/${pairId}-${slugify(branchTitle(goal))}`;
 				const checkout = await git(pi, ctx.cwd, ["checkout", "-b", pairBranch]);
 				if (checkout.code !== 0) throw new Error(resultText(checkout));
 				const now = new Date().toISOString();
 				const state: PairState = { pairId, goal, phase: "awaiting_checkpoint_confirmation", pairBranch, baseBranch, baseSha, createdAt: now, updatedAt: now };
 				await saveState(pi, ctx.cwd, state);
 				ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(state.phase)}`);
-				ctx.ui.notify(`Pair session started on ${pairBranch}. Agent must call pair_confirm_checkpoint before tools.`, "info");
+				ctx.ui.notify(`Pair session started on ${pairBranch}. Agent will plan first; run /pair_confirm_checkpoint when satisfied.`, "info");
+				pi.sendUserMessage(pairPlanningPrompt(goal));
 			} catch (error) {
 				await notifyError(ctx, "Pair start failed", error);
 			}
 		},
 	});
 
-	pi.registerCommand("pair-confirm", {
-		description: "Manually confirm checkpoint and unlock agent tools",
+	async function confirmCheckpointFromCommand(args: string, ctx: any): Promise<void> {
+		const state = await loadState(pi, ctx.cwd);
+		if (!state) throw new Error("No active pair-program session.");
+		if (state.phase !== "awaiting_checkpoint_confirmation") throw new Error(`Cannot confirm during ${phaseLabel(state.phase)}.`);
+		state.checkpoint = args.trim() || state.checkpoint || "Human-approved checkpoint from planning conversation";
+		state.phase = "agent_work";
+		await saveState(pi, ctx.cwd, state);
+		ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(state.phase)}`);
+		ctx.ui.notify("Checkpoint confirmed; agent tools are unlocked.", "info");
+		pi.sendUserMessage(
+			[
+				"Checkpoint confirmed by human.",
+				"",
+				"Approved checkpoint:",
+				state.checkpoint,
+				"",
+				"Start implementing this checkpoint now. When finished, call pair_agent_done with a concise summary.",
+			].join("\n"),
+		);
+	}
+
+	pi.registerCommand("pair_confirm_checkpoint", {
+		description: "Confirm the agent-proposed checkpoint and unlock agent tools",
 		handler: async (args, ctx) => {
 			try {
-				const state = await loadState(pi, ctx.cwd);
-				if (!state) throw new Error("No active pair-program session.");
-				if (state.phase !== "awaiting_checkpoint_confirmation") throw new Error(`Cannot confirm during ${phaseLabel(state.phase)}.`);
-				state.checkpoint = args.trim() || state.checkpoint || "Manual checkpoint confirmation";
-				state.phase = "agent_work";
-				await saveState(pi, ctx.cwd, state);
-				ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(state.phase)}`);
-				ctx.ui.notify("Checkpoint confirmed; agent tools are unlocked.", "info");
+				await confirmCheckpointFromCommand(args, ctx);
+			} catch (error) {
+				await notifyError(ctx, "Pair checkpoint confirmation failed", error);
+			}
+		},
+	});
+
+	pi.registerCommand("pair-confirm", {
+		description: "Alias for /pair_confirm_checkpoint",
+		handler: async (args, ctx) => {
+			try {
+				await confirmCheckpointFromCommand(args, ctx);
 			} catch (error) {
 				await notifyError(ctx, "Pair confirm failed", error);
 			}
 		},
 	});
+
+	function defaultHumanSummary(outcome: ReviewOutcome): string {
+		if (outcome === "Updates needed") return "updates needed";
+		if (outcome === "Checkpoint approval") return "checkpoint approved";
+		return "final approved";
+	}
+
+	async function finishHumanReview(ctx: any, summaryOverride?: string): Promise<boolean> {
+		const state = await loadState(pi, ctx.cwd);
+		if (!state) throw new Error("No active pair-program session.");
+		if (state.phase !== "human_review") throw new Error(`Cannot finish human review during ${phaseLabel(state.phase)}.`);
+		const review = await readFile(resolve(ctx.cwd, REVIEW_PATH), "utf8");
+		const outcome = parseReviewOutcome(review);
+		if (!outcome) {
+			ctx.ui.notify("Select exactly one review outcome in .pi/review.md to finish human review.", "info");
+			return false;
+		}
+		const summary = summaryOverride?.trim() || defaultHumanSummary(outcome);
+		const reviewDiff = await humanReviewDiff(pi, ctx.cwd);
+		const commit = await commitCheckpoint(pi, ctx.cwd, `human: ${summary}`);
+		state.lastOutcome = outcome;
+		state.phase = outcome === "Final approval" ? "final_approved" : "awaiting_checkpoint_confirmation";
+		await saveState(pi, ctx.cwd, state);
+		ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(state.phase)}`);
+		ctx.ui.notify(`Human checkpoint committed (${commit}). Outcome: ${outcome}.`, "info");
+		if (state.phase === "awaiting_checkpoint_confirmation") {
+			pi.sendUserMessage(
+				[
+					"Human review is complete.",
+					"",
+					`Review outcome: ${outcome}`,
+					"The human review checkpoint was committed. Use the diff below as primary context; it contains only changes since the agent handoff, including human edits to .pi/review.md.",
+					"",
+					reviewDiff,
+					"",
+					outcome === "Updates needed"
+						? "Explain what you will change next based on the review outcome and human review diff, then propose the ideal next checkpoint goal."
+						: "Explain what you will do next toward the overall goal based on the human review diff, then propose the ideal next checkpoint goal.",
+					"Use read-only exploration as needed. Do not edit files or run destructive commands until the human runs /pair_confirm_checkpoint.",
+				].join("\n"),
+			);
+		} else if (state.phase === "final_approved") {
+			pi.sendUserMessage(
+				[
+					"Human gave final approval.",
+					"The human review checkpoint was committed. The diff below contains only changes since the agent handoff, including human edits to .pi/review.md.",
+					"",
+					reviewDiff,
+					"",
+					"Generate a concise final commit message for the completed work, then call pair_finalize with that message.",
+					"Do not make further code changes.",
+				].join("\n"),
+			);
+		}
+		return true;
+	}
 
 	pi.registerCommand("pair-review", {
 		description: "Open .pi/review.md in Pi editor for human review",
@@ -566,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 				const edited = await ctx.ui.editor("Edit .pi/review.md", current);
 				if (edited !== undefined) {
 					await writeFile(path, edited, "utf8");
-					ctx.ui.notify("Updated .pi/review.md. Edit code externally if needed, then run /pair-human-done <summary>.", "info");
+					await finishHumanReview(ctx);
 				}
 			} catch (error) {
 				await notifyError(ctx, "Pair review failed", error);
@@ -575,24 +737,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("pair-human-done", {
-		description: "Commit human review checkpoint and transition based on selected review outcome",
+		description: "Optional/manual fallback: commit human review checkpoint and transition based on selected review outcome",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 			try {
-				const summary = args.trim();
-				if (!summary) throw new Error("Usage: /pair-human-done <summary>");
-				const state = await loadState(pi, ctx.cwd);
-				if (!state) throw new Error("No active pair-program session.");
-				if (state.phase !== "human_review") throw new Error(`Cannot finish human review during ${phaseLabel(state.phase)}.`);
-				const review = await readFile(resolve(ctx.cwd, REVIEW_PATH), "utf8");
-				const outcome = parseReviewOutcome(review);
-				if (!outcome) throw new Error("Select exactly one review outcome in .pi/review.md before /pair-human-done.");
-				const commit = await commitCheckpoint(pi, ctx.cwd, `human: ${summary}`);
-				state.lastOutcome = outcome;
-				state.phase = outcome === "Final approval" ? "final_approved" : "awaiting_checkpoint_confirmation";
-				await saveState(pi, ctx.cwd, state);
-				ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(state.phase)}`);
-				ctx.ui.notify(`Human checkpoint committed (${commit}). Outcome: ${outcome}.`, "info");
+				await finishHumanReview(ctx, args.trim() || undefined);
 			} catch (error) {
 				await notifyError(ctx, "Pair human done failed", error);
 			}
@@ -620,9 +769,14 @@ export default function (pi: ExtensionAPI) {
 					].join("\n"),
 				);
 				if (!ok) throw new Error("Finalize cancelled");
-				const next = await finalizePair(pi, ctx.cwd, state, message);
+				let next = await finalizePair(pi, ctx.cwd, state, message);
 				ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(next.phase)}`);
 				ctx.ui.notify(`Finalized ${shortSha(next.finalCommit)}. Backup branch: ${next.backupBranch}.`, "info");
+				if (await ctx.ui.confirm("Publish finalized work now?", "Fast-forward merge the finalized pair branch into the base branch now?")) {
+					next = await publishPair(pi, ctx.cwd, next, undefined, ctx);
+					ctx.ui.setStatus("pair-program", `pair: ${phaseLabel(next.phase)}`);
+					ctx.ui.notify(`Published ${shortSha(next.finalCommit)} to ${next.targetBranch}.`, "info");
+				}
 			} catch (error) {
 				await notifyError(ctx, "Pair finalize failed", error);
 			}
