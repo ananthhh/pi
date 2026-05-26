@@ -1,59 +1,48 @@
 ---
 name: tk-worker
-description: worker skill. Use only when explicitly invoked using skill command.
+description: Worker skill for implementing tk tickets. Follows the tk-worker extension workflow.
 ---
 
 # TK Worker
 
-Execution mode for the `tk` ticket system. Work one ticket at a time.
-If pair-programming is active, use the generic `pair-program` checkpoint/review workflow at each planned checkpoint.
+Execution mode for the `tk` ticket system. Work one epic at a time using the `tk-worker` extension.
 
 ## TK Conventions
 
 - Run `tk help` when command syntax is unclear.
 - List open/in-progress epics with: `tk ready -T epic`.
-- Get the next ready ticket in an epic with: `tk ready -T epic-<epic-id>`.
-- List epic tickets with: `tk ls -T epic-<epic-id>`.
 - Read an epic/ticket with: `tk show <id>`.
-- Mark epic/ticket state with the project's `tk status` convention.
 
 ## Starting an Epic
 
 When explicitly asked to start an epic:
 
 1. Select the matching epic; ask if ambiguous.
-2. Mark the epic `in_progress`.
-3. Get the next ready ticket and start it
+2. Mark the epic `in_progress` with `by_worker` tag (the `/tk-worker` command handles this).
+3. The extension creates a branch and hands off to you.
 
-## Starting a Ticket
+## Workflow
 
-For each ticket:
+The `tk-worker` extension manages the pair-program workflow:
 
-1. Read epic and ticket context with `tk show`.
-2. Mark the ticket `in_progress`.
-3. Identify the concrete worker skill:
-   - UI work → `tk-worker-web-ui`
-   - Other task-specific skills may be added later
+1. **Agent work phase** — You implement the ticket. Edit source files, run tests, etc.
+2. When done, call `tk_worker_agent_done` with a concise summary.
+3. The extension commits your work and hands off to human review.
+4. **Human review phase** — The human reviews, edits code, and runs `/tk-worker`.
+5. If updates are needed, the extension commits human changes and hands back to you.
+6. If approved, the extension asks you to generate a final commit message and call `tk_worker_finalize`.
+7. The extension squashes commits, merges to main, and closes the epic.
 
 ## Implementation
 
-Follow the ticket, epic context, project instructions, and concrete worker skill. The concrete worker skill defines what to build and how to verify it.
+Follow the epic ticket, project instructions, and concrete worker skills:
 
-## Checkpoints When Pair-Programming
+- UI work → `tk-worker-web-ui`
+- Other task-specific skills may be added later
 
-The ticket's `## Planned Checkpoints` section defines where to pause. If none exist, create lightweight ones:
-
-- After the first vertical slice
-- After tests pass
-- Before finalization
-
-At each checkpoint, return to the active `pair-program` workflow.
-
-## After Final Approval
+## Finalizing
 
 Only after explicit final approval:
 
-1. Close the ticket: `tk status <ticket-id> closed`.
-2. Show epic progress: `tk ls -T epic-<epic-id>`.
-3. Continue `Finalize Work` step in pair-program skill if it's active
-
+1. Call `tk_worker_finalize` with a good commit message.
+2. The extension handles squash, merge, and closing the epic.

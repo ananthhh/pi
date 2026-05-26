@@ -6,11 +6,10 @@ type ExecResult = { stdout?: string; stderr?: string; code: number; killed?: boo
 
 type TicketInfo = { id: string; title: string; status: string; tags: string[]; path: string };
 
-const ARCHITECT_TOOLS = new Set(["tk_architect_agent_done", "tk_architect_finalize"]);
+const WORKER_TOOLS = new Set(["tk_worker_agent_done", "tk_worker_finalize", "tk_status"]);
 const GUARDED_TOOLS = new Set(["bash", "read", "edit", "write"]);
-const ARCHITECT_TAG = "by_architect";
+const WORKER_TAG = "by_worker";
 const PHASE_TAGS = ["agent_work", "human_review", "final_approved"];
-const PLANNING_TAG = "architect_planning";
 
 /* ─── Git helpers ─── */
 
@@ -159,9 +158,9 @@ async function queryTickets(pi: ExtensionAPI, cwd: string): Promise<TicketInfo[]
 	return tickets;
 }
 
-async function findArchitectEpic(pi: ExtensionAPI, cwd: string): Promise<TicketInfo | undefined> {
+async function findWorkerEpic(pi: ExtensionAPI, cwd: string): Promise<TicketInfo | undefined> {
 	const all = await queryTickets(pi, cwd);
-	const candidates = all.filter((t) => t.status === "in_progress" && t.tags.includes(ARCHITECT_TAG));
+	const candidates = all.filter((t) => t.status === "in_progress" && t.tags.includes(WORKER_TAG));
 	if (candidates.length === 1) return candidates[0];
 
 	// Fallback: check branch name
@@ -171,7 +170,7 @@ async function findArchitectEpic(pi: ExtensionAPI, cwd: string): Promise<TicketI
 		if (match) {
 			const epicId = match[1];
 			const found = all.find((t) => t.id === epicId);
-			if (found && found.tags.includes(ARCHITECT_TAG)) return found;
+			if (found && found.tags.includes(WORKER_TAG)) return found;
 		}
 	} catch {
 		/* ignore */
@@ -218,32 +217,6 @@ async function latestHumanDiff(pi: ExtensionAPI, cwd: string): Promise<string> {
 	].join("\n");
 }
 
-function isSafeArchitectBash(command: string): boolean {
-	const normalized = command.trim();
-	if (!normalized) return false;
-	if (/[;&|`$<>]/.test(normalized)) return false;
-	if (/\b(rm|mv|cp|mkdir|touch|chmod|chown|sudo|python|node|perl|ruby|sed|awk)\b/i.test(normalized)) return false;
-	if (destructiveGitCommand(normalized)) return false;
-
-	// Allow tk commands (create, edit, dep, etc.)
-	if (/^tk\s+/.test(normalized)) return true;
-
-	// Allow read-only git
-	if (/^git\s+(status|log|show|diff|ls-files)\b/.test(normalized)) return true;
-
-	// Allow read-only exploration
-	if (/^(pwd|ls|rg|grep|find)\b/.test(normalized)) return true;
-
-	return false;
-}
-
-async function touchesOnlyTickets(cwd: string, event: any): Promise<boolean> {
-	const input = event.input ?? {};
-	const paths = [input.path, ...(Array.isArray(input.paths) ? input.paths : [])].filter(Boolean).map((p: any) => String(p).replace(/^@/, ""));
-	if (paths.length === 0) return false;
-	return paths.every((p: string) => p.includes(".tickets/") || p.endsWith(".md") && !p.startsWith("/"));
-}
-
 async function notifyError(ctx: any, prefix: string, error: unknown): Promise<void> {
 	ctx.ui.notify(`${prefix}: ${error instanceof Error ? error.message : String(error)}`, "error");
 }
@@ -252,60 +225,50 @@ async function notifyError(ctx: any, prefix: string, error: unknown): Promise<vo
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		const epic = await findArchitectEpic(pi, ctx.cwd).catch(() => undefined);
-		ctx.ui.setStatus("tk-architect", epic ? `architect: ${phaseLabel(epic.tags)}` : undefined);
+		const epic = await findWorkerEpic(pi, ctx.cwd).catch(() => undefined);
+		ctx.ui.setStatus("tk-worker", epic ? `worker: ${phaseLabel(epic.tags)}` : undefined);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		const epic = await findArchitectEpic(pi, ctx.cwd).catch(() => undefined);
-		if (!epic || !epic.tags.includes(ARCHITECT_TAG)) return undefined;
+		const epic = await findWorkerEpic(pi, ctx.cwd).catch(() => undefined);
+		if (!epic || !epic.tags.includes(WORKER_TAG)) return undefined;
 
-		let guidance = `TK Architect extension is active. Epic: ${epic.id} — ${epic.title}.`;
+		let guidance = `TK Worker extension is active. Epic: ${epic.id} — ${epic.title}.`;
 		guidance += `\nCurrent phase: ${phaseLabel(epic.tags)}.`;
-		if (epic.tags.includes(PLANNING_TAG)) {
-			guidance += "\nThis epic is in the architect planning stage.";
-		}
 
 		if (epic.tags.includes("agent_work")) {
-			guidance += [
-				"\nYou may edit any .tickets/*.md file and run tk commands (create, dep, status, etc.) to build the architecture.",
-				"Do not edit implementation source files outside .tickets/.",
-				"When the plan is complete, call tk_architect_agent_done with a summary.",
-			].join("\n");
+			guidance += "\nImplement the goal. When done, call tk_worker_agent_done with a concise summary.";
 		} else if (epic.tags.includes("human_review")) {
-			guidance += "\nHuman review is active. Do not use file/git tools; wait for the human to run /tk-architect to continue.";
+			guidance += "\nHuman review is active. Do not use file/git tools; wait for the human to run /tk-worker to continue.";
 		} else if (epic.tags.includes("final_approved")) {
-			guidance += "\nArchitecture is approved. Generate a concise final commit message and call tk_architect_finalize. Do not make further changes.";
+			guidance += "\nWork is approved. Generate a concise final commit message and call tk_worker_finalize. Do not make further code changes.";
 		}
 
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		const epic = await findArchitectEpic(pi, ctx.cwd).catch(() => undefined);
-		if (!epic || !epic.tags.includes(ARCHITECT_TAG)) return undefined;
-		if (ARCHITECT_TOOLS.has(event.toolName)) return undefined;
+		const epic = await findWorkerEpic(pi, ctx.cwd).catch(() => undefined);
+		if (!epic || !epic.tags.includes(WORKER_TAG)) return undefined;
+		if (WORKER_TOOLS.has(event.toolName)) return undefined;
 		if (!GUARDED_TOOLS.has(event.toolName)) return undefined;
 
 		if (epic.tags.includes("human_review")) {
 			return {
 				block: true,
-				reason: "TK architect guard: human review in progress. Wait for the human to run /tk-architect to continue.",
+				reason: "TK worker guard: human review in progress. Wait for the human to run /tk-worker to continue.",
 			};
 		}
 		if (epic.tags.includes("final_approved")) {
-			if (event.toolName === "tk_architect_finalize") return undefined;
+			if (event.toolName === "tk_worker_finalize") return undefined;
 			return {
 				block: true,
-				reason: "TK architect guard: architecture is approved. Only tk_architect_finalize is allowed.",
+				reason: "TK worker guard: work is approved. Only tk_worker_finalize is allowed to create the final commit.",
 			};
 		}
 		if (epic.tags.includes("agent_work")) {
-			if (event.toolName === "bash" && !isSafeArchitectBash(String((event.input as any)?.command ?? ""))) {
-				return { block: true, reason: "TK architect guard: bash is limited to tk commands and read-only exploration." };
-			}
-			if ((event.toolName === "edit" || event.toolName === "write") && !(await touchesOnlyTickets(ctx.cwd, event))) {
-				return { block: true, reason: "TK architect guard: only .tickets/*.md files may be edited during planning." };
+			if (event.toolName === "bash" && destructiveGitCommand(String((event.input as any)?.command ?? ""))) {
+				return { block: true, reason: "TK worker guard: git history operations must use tk-worker tools." };
 			}
 			return undefined;
 		}
@@ -315,35 +278,29 @@ export default function (pi: ExtensionAPI) {
 	/* ─── Tools ─── */
 
 	pi.registerTool({
-		name: "tk_architect_agent_done",
-		label: "TK Architect Agent Done",
-		description: "Commit architect work and hand control to human for review.",
-		promptSnippet: "Finish the current tk-architect iteration by committing work and requesting human review.",
+		name: "tk_worker_agent_done",
+		label: "TK Worker Agent Done",
+		description: "Commit agent work and hand control to human for review.",
+		promptSnippet: "Finish the current tk-worker iteration by committing work and requesting human review.",
 		parameters: {
 			type: "object",
-			properties: { summary: { type: "string", description: "Brief summary of the architecture draft" } },
+			properties: { summary: { type: "string", description: "Concise summary of the work done in this iteration" } },
 			required: ["summary"],
 			additionalProperties: false,
 		} as any,
 		async execute(_id, params: any, _signal, _onUpdate, ctx) {
-			const epic = await findArchitectEpic(pi, ctx.cwd);
-			if (!epic) throw new Error("No active tk-architect epic. Run /tk-architect <title> first.");
+			const epic = await findWorkerEpic(pi, ctx.cwd);
+			if (!epic) throw new Error("No active tk-worker epic. Run /tk-worker <goal> first.");
 			if (!epic.tags.includes("agent_work")) throw new Error(`Cannot finish agent work during ${phaseLabel(epic.tags)}.`);
 			const summary = String(params.summary ?? "").trim();
 			if (!summary) throw new Error("summary is required.");
 
 			const commit = await commitAll(pi, ctx.cwd, `agent: ${summary}`);
-			await updateTicketTags(
-				pi,
-				ctx.cwd,
-				epic.id,
-				["human_review"],
-				PHASE_TAGS.filter((t) => t !== "human_review"),
-			);
+			await updateTicketTags(pi, ctx.cwd, epic.id, ["human_review"], PHASE_TAGS.filter((t) => t !== "human_review"));
 
-			ctx.ui.setStatus("tk-architect", `architect: human review`);
+			ctx.ui.setStatus("tk-worker", `worker: human review`);
 			return {
-				content: [{ type: "text", text: `Architect work committed (${commit}). Run /tk-architect after reviewing to continue or finalize.` }],
+				content: [{ type: "text", text: `Agent work committed (${commit}). Run /tk-worker after making your changes to send back to the agent, or clear state to finalize.` }],
 				details: { commit, phase: "human_review" },
 				terminate: true,
 			};
@@ -351,10 +308,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "tk_architect_finalize",
-		label: "TK Architect Finalize",
-		description: "Squash all tk-architect commits into one, merge to main, and open the epic for workers.",
-		promptSnippet: "Finalize tk-architect work by providing the final squashed commit message.",
+		name: "tk_worker_finalize",
+		label: "TK Worker Finalize",
+		description: "Squash all tk-worker commits into one, merge to main, and close the epic.",
+		promptSnippet: "Finalize tk-worker work by providing the final squashed commit message.",
 		parameters: {
 			type: "object",
 			properties: { message: { type: "string", description: "Final commit message for the squashed commit" } },
@@ -362,8 +319,8 @@ export default function (pi: ExtensionAPI) {
 			additionalProperties: false,
 		} as any,
 		async execute(_id, params: any, _signal, _onUpdate, ctx) {
-			const epic = await findArchitectEpic(pi, ctx.cwd);
-			if (!epic) throw new Error("No active tk-architect epic. Run /tk-architect <title> first.");
+			const epic = await findWorkerEpic(pi, ctx.cwd);
+			if (!epic) throw new Error("No active tk-worker epic. Run /tk-worker <goal> first.");
 			if (!epic.tags.includes("final_approved")) throw new Error(`Cannot finalize during ${phaseLabel(epic.tags)}.`);
 			const message = String(params.message ?? "").trim();
 			if (!message) throw new Error("message is required.");
@@ -387,12 +344,13 @@ export default function (pi: ExtensionAPI) {
 			if (reset.code !== 0) throw new Error(resultText(reset));
 
 			if (await gitOk(pi, ctx.cwd, ["diff", "--cached", "--quiet"])) {
+				// No changes
 				await git(pi, ctx.cwd, ["checkout", base]);
-				await updateTicketStatus(pi, ctx.cwd, epic.id, "open");
-				await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, ARCHITECT_TAG, PLANNING_TAG]);
-				ctx.ui.setStatus("tk-architect", undefined);
+				await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
+				await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
+				ctx.ui.setStatus("tk-worker", undefined);
 				return {
-					content: [{ type: "text", text: "No changes to finalize. Epic opened for workers. Session ended." }],
+					content: [{ type: "text", text: "No changes to finalize. Epic closed. Session ended." }],
 					terminate: true,
 				};
 			}
@@ -412,9 +370,9 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`Fast-forward merge to ${base} failed: ${resultText(merge)}`);
 			}
 
-			// Open epic and clean up tags
-			await updateTicketStatus(pi, ctx.cwd, epic.id, "open");
-			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, ARCHITECT_TAG, PLANNING_TAG]);
+			// Close epic and clean up tags
+			await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
+			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
 
 			// Ask to delete branch
 			let deleted = false;
@@ -424,12 +382,12 @@ export default function (pi: ExtensionAPI) {
 				deleted = true;
 			}
 
-			ctx.ui.setStatus("tk-architect", undefined);
+			ctx.ui.setStatus("tk-worker", undefined);
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Finalized ${finalCommit.slice(0, 12)} and merged to ${base}. Epic ${epic.id} opened for workers. ${deleted ? `Branch ${currentBranch} deleted.` : `Branch ${currentBranch} kept.`}`,
+						text: `Finalized ${finalCommit.slice(0, 12)} and merged to ${base}. Epic ${epic.id} closed. ${deleted ? `Branch ${currentBranch} deleted.` : `Branch ${currentBranch} kept.`}`,
 					},
 				],
 				terminate: true,
@@ -437,19 +395,63 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "tk_status",
+		label: "TK Status",
+		description: "Show tk ticket status: available epics on main, or active epic on a feature branch.",
+		promptSnippet: "Check the current tk ticket status.",
+		parameters: { type: "object", properties: {}, additionalProperties: false } as any,
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const currentBranch = await gitOutput(pi, ctx.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => "unknown");
+			const base = await defaultBranch(pi, ctx.cwd);
+
+			if (currentBranch === base) {
+				// On main: show ready epics
+				const ready = await tk(pi, ctx.cwd, ["ready", "-T", "epic"]).catch((e) => ({ code: 1, stdout: "", stderr: String(e) } as ExecResult));
+				const text = ready.code === 0 ? (ready.stdout ?? "No ready epics.") : `Error listing epics: ${resultText(ready)}`;
+				return { content: [{ type: "text", text: `On ${base}. Ready epics:\n${text}` }] };
+			}
+
+			// On feature branch: show active epic
+			let epicId: string | undefined;
+			const epic = await findWorkerEpic(pi, ctx.cwd).catch(() => undefined);
+			if (epic) {
+				epicId = epic.id;
+			} else {
+				const match = currentBranch.match(/^epic\/([a-z]{1,3}-[a-z0-9]{4})-/i);
+				if (match) epicId = match[1];
+			}
+
+			if (!epicId) {
+				return { content: [{ type: "text", text: `On ${currentBranch}. No active epic found.` }] };
+			}
+
+			const show = await tk(pi, ctx.cwd, ["show", epicId]).catch((e) => ({ code: 1, stdout: "", stderr: String(e) } as ExecResult));
+			const text = show.code === 0 ? (show.stdout ?? "") : `Error showing epic: ${resultText(show)}`;
+			return {
+				content: [
+					{
+						type: "text",
+						text: `On ${currentBranch}. Active epic:\n${text}`,
+					},
+				],
+			};
+		},
+	});
+
 	/* ─── Command ─── */
 
-	pi.registerCommand("tk-architect", {
-		description: "Start or continue a tk-architect session",
+	pi.registerCommand("tk-worker", {
+		description: "Start or continue a tk-worker session",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 			try {
-				let epic = await findArchitectEpic(pi, ctx.cwd);
+				let epic = await findWorkerEpic(pi, ctx.cwd);
 
 				// No active epic: try to find or create one
 				if (!epic) {
 					const all = await queryTickets(pi, ctx.cwd);
-					const inProgress = all.filter((t) => t.status === "in_progress" && t.tags.includes(ARCHITECT_TAG));
+					const inProgress = all.filter((t) => t.status === "in_progress" && t.tags.includes(WORKER_TAG));
 
 					if (inProgress.length > 0 && ctx.hasUI) {
 						const choices = [
@@ -460,19 +462,19 @@ export default function (pi: ExtensionAPI) {
 						if (!choice) throw new Error("No epic selected.");
 
 						if (choice === "Start a new epic") {
-							/* fall through to create new */
+							// Fall through to create new
 						} else {
 							const id = choice.split(" — ")[0];
 							epic = all.find((t) => t.id === id);
 							if (!epic) throw new Error("Selected epic not found.");
-							if (!epic.tags.includes(ARCHITECT_TAG)) throw new Error(`Epic ${epic.id} is not an architect epic.`);
+							if (!epic.tags.includes(WORKER_TAG)) throw new Error(`Epic ${epic.id} is not a worker epic.`);
 						}
 					}
 
 					// Still no epic: create new
 					if (!epic) {
-						const title = args.trim() || (ctx.hasUI ? await ctx.ui.input("Enter the title for this tk-architect epic:") : "");
-						if (!title) throw new Error("Usage: /tk-architect <title>");
+						const goal = args.trim() || (ctx.hasUI ? await ctx.ui.input("Enter the goal for this tk-worker epic:") : "");
+						if (!goal) throw new Error("Usage: /tk-worker <goal>");
 
 						if (!(await gitOk(pi, ctx.cwd, ["rev-parse", "--is-inside-work-tree"]))) {
 							throw new Error("Not inside a git worktree.");
@@ -490,17 +492,10 @@ export default function (pi: ExtensionAPI) {
 							if (!proceed) throw new Error("Start cancelled");
 						}
 
-						const epicId = await tkOutput(pi, ctx.cwd, [
-							"create",
-							title,
-							"--type",
-							"epic",
-							"--tags",
-							[ARCHITECT_TAG, "agent_work", PLANNING_TAG].join(","),
-						]);
+						const epicId = await tkOutput(pi, ctx.cwd, ["create", goal, "--type", "epic", "--tags", [WORKER_TAG, "agent_work"].join(",")]);
 						await tk(pi, ctx.cwd, ["start", epicId]);
 
-						const epicBranch = `epic/${epicId}-${slugify(branchTitle(title))}`;
+						const epicBranch = `epic/${epicId}-${slugify(branchTitle(goal))}`;
 						const checkout = await git(pi, ctx.cwd, ["checkout", "-b", epicBranch]);
 						if (checkout.code !== 0) throw new Error(resultText(checkout));
 
@@ -511,26 +506,19 @@ export default function (pi: ExtensionAPI) {
 						epic = all2.find((t) => t.id === epicId);
 						if (!epic) throw new Error("Created epic not found.");
 
-						ctx.ui.setStatus("tk-architect", `architect: agent work`);
-						ctx.ui.notify(`Architect epic ${epicId} started on ${epicBranch}.`, "info");
+						ctx.ui.setStatus("tk-worker", `worker: agent work`);
+						ctx.ui.notify(`Worker epic ${epicId} started on ${epicBranch}.`, "info");
 
-						pi.sendUserMessage(
-							[
-								`TK Architect: fill the epic ticket ${epicId} and create child tickets with dependencies as needed.`,
-								"You may edit any .tickets/*.md file and run tk commands (create, dep, status, etc.).",
-								"Do not edit implementation source files outside .tickets/.",
-								"When the architecture is complete, call tk_architect_agent_done with a summary.",
-							].join("\n"),
-						);
+						pi.sendUserMessage(goal);
 						return;
 					}
 				}
 
-				if (!epic) throw new Error("No active tk-architect epic found.");
+				if (!epic) throw new Error("No active tk-worker epic found.");
 
 				// Continue existing epic based on phase
 				if (epic.tags.includes("agent_work")) {
-					throw new Error("Agent is currently working. Wait for it to call tk_architect_agent_done.");
+					throw new Error("Agent is currently working. Wait for it to call tk_worker_agent_done.");
 				}
 
 				if (epic.tags.includes("human_review")) {
@@ -543,7 +531,7 @@ export default function (pi: ExtensionAPI) {
 
 					if (!ctx.hasUI) {
 						await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], PHASE_TAGS.filter((t) => t !== "agent_work"));
-						ctx.ui.setStatus("tk-architect", `architect: agent work`);
+						ctx.ui.setStatus("tk-worker", `worker: agent work`);
 						const diff = await latestHumanDiff(pi, ctx.cwd);
 						pi.sendUserMessage(
 							[
@@ -558,24 +546,24 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					const needsUpdates = await ctx.ui.confirm(
-						"Review architect work",
-						"Do you need to make updates or leave review comments for the architect?\n\n• Yes: Changes will be committed and sent back to agent.\n• No: Finalize and merge the architecture.",
+						"Review agent work",
+						"Do you need to make updates or leave review comments for the agent?\n\n• Yes: Changes will be committed and sent back to agent.\n• No: Finalize and merge the work.",
 					);
 
 					if (needsUpdates) {
 						await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], PHASE_TAGS.filter((t) => t !== "agent_work"));
-						ctx.ui.setStatus("tk-architect", `architect: agent work`);
-						ctx.ui.notify("Human changes committed. Sending back to architect.", "info");
+						ctx.ui.setStatus("tk-worker", `worker: agent work`);
+						ctx.ui.notify("Human changes committed. Sending back to agent.", "info");
 						const diff = await latestHumanDiff(pi, ctx.cwd);
 						pi.sendUserMessage(
 							[
 								"Human review complete. Updates are needed.",
 								"",
 								"The diff below shows only the human's changes since the last agent handoff. The human may have:",
-								"1. Made edits to .tickets/*.md files directly",
+								"1. Made code changes directly",
 								"2. Left review comments prefixed with REVIEW: for you to address",
 								"",
-								"Read the diff carefully. Address any REVIEW: comments. When done, call tk_architect_agent_done with a summary.",
+								"Read the diff carefully. Address any REVIEW: comments. When done, call tk_worker_agent_done with a summary.",
 								"",
 								diff,
 							].join("\n"),
@@ -583,13 +571,13 @@ export default function (pi: ExtensionAPI) {
 						return;
 					} else {
 						await updateTicketTags(pi, ctx.cwd, epic.id, ["final_approved"], PHASE_TAGS.filter((t) => t !== "final_approved"));
-						ctx.ui.setStatus("tk-architect", `architect: final approved`);
+						ctx.ui.setStatus("tk-worker", `worker: final approved`);
 						pi.sendUserMessage(
 							[
-								"No updates needed. The architecture is approved.",
+								"No updates needed. The work is approved.",
 								"",
-								"Generate a concise, descriptive final commit message for all the architecture work completed on this branch, then call tk_architect_finalize with that message.",
-								"Do not make any further changes.",
+								"Generate a concise, descriptive final commit message for all the work completed on this branch, then call tk_worker_finalize with that message.",
+								"Do not make any further code changes.",
 							].join("\n"),
 							{ deliverAs: "followUp" },
 						);
@@ -598,10 +586,10 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (epic.tags.includes("final_approved")) {
-					throw new Error("Architecture is approved. The agent should generate a final commit message and call tk_architect_finalize.");
+					throw new Error("Work is approved. The agent should generate a final commit message and call tk_worker_finalize.");
 				}
 			} catch (error) {
-				await notifyError(ctx, "TK architect failed", error);
+				await notifyError(ctx, "TK worker failed", error);
 			}
 		},
 	});

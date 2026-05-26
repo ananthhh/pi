@@ -1,34 +1,52 @@
 ---
 name: tk-architect
-description: TK architect is automated by the tk-architect extension. Use slash commands instead of this skill.
+description: Architect skill for planning tk epics. Uses the tk-architect extension for the planning workflow.
 ---
 
 # TK Architect
 
-Use deterministic extension commands:
+Planning mode for the `tk` ticket system. Build architecture in one session using the `tk-architect` extension.
 
-```text
-/tk-architect-start <epic title>
-/tk-architect-review
-/tk-architect-child <child ticket title>
-/tk-architect-dep <ticket-id> <depends-on-id>
-/tk-architect-review-deps
-/tk-architect-finalize
-/tk-architect-status
-```
+## TK Conventions
 
-The extension edits real `tk` ticket files directly under `.tickets/`.
+- Run `tk help` when command syntax is unclear.
+- List epics with: `tk ls --status=in_progress -T by_architect`.
+- Read an epic/ticket with: `tk show <id>`.
 
-Flow:
+## Starting an Architecture Session
 
-1. `/tk-architect-start <epic title>` creates the epic ticket and hands that ticket file to the agent.
-2. Agent edits only the active `.tickets/*.md` file and calls `tk_architect_agent_done`.
-3. `/tk-architect-review` opens the active ticket for human review. After the editor closes, choose:
-   - move on / approve this ticket
-   - stay on this ticket / send back to agent
-   - just save and decide later
-4. Repeat with `/tk-architect-child <title>` for each child ticket.
-5. Add dependencies with `/tk-architect-dep <ticket-id> <depends-on-id>`.
-6. Review dependencies with `/tk-architect-review-deps`, then `/tk-architect-finalize`.
+When explicitly asked to plan an epic:
 
-Workflow state is stored in `.git/pi-tk-architect-state.json`.
+1. Run `/tk-architect <title>` to create the epic.
+2. The extension creates the epic ticket (`in_progress`, `by_architect`, `agent_work`, `architect_planning`), creates a branch, and hands off to you.
+
+## Workflow
+
+The `tk-architect` extension manages the pair-program workflow:
+
+1. **Agent work phase** — You plan the architecture. You may:
+   - Edit any `.tickets/*.md` file
+   - Run `tk` commands: `tk create`, `tk dep`, `tk status`, `tk show`, etc.
+   - Do NOT edit implementation source files outside `.tickets/`
+2. When the architecture is complete, call `tk_architect_agent_done` with a summary.
+3. The extension commits your work and hands off to human review.
+4. **Human review phase** — The human reviews the tickets and runs `/tk-architect`.
+5. If updates are needed, the extension commits changes and hands back to you.
+6. If approved, the extension asks you to generate a final commit message and call `tk_architect_finalize`.
+7. The extension squashes commits, merges to main, sets the epic `open`, and removes planning tags. The epic is now available for workers.
+
+## What to Plan
+
+In one session, you should:
+
+1. Fill out the epic markdown file with: Problem/Goal, Scope, Non-Goals, Child Ticket Plan, Dependency Plan, Open Questions
+2. Create child tickets using `tk create <title> --parent <epic-id>`
+3. Add dependencies between tickets using `tk dep <id> <depends-on-id>`
+4. Fill out child ticket markdowns with: Research, Design, Acceptance Criteria, Notes/Risks
+
+## Finalizing
+
+Only after explicit final approval:
+
+1. Call `tk_architect_finalize` with a good commit message.
+2. The extension handles squash, merge, and opening the epic for workers.
