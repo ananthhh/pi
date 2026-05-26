@@ -252,7 +252,6 @@ function buildNotificationLines(mr: MultiRangeResult): string {
 
 export default function (pi: ExtensionAPI) {
 	let apiKey: string | null = null;
-	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	let lastToday: RangeResult | null = null;
 	let lastMulti: MultiRangeResult | null = null;
 	let widgetVisible = false;
@@ -292,38 +291,31 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	}
 
-	function startRefresh(ctx: ExtensionContext) {
-		stopRefresh();
-		refreshToday(ctx);
-		refreshTimer = setInterval(() => {
-			if (widgetVisible && lastMulti) {
-				refreshAll(ctx);
-			} else {
-				refreshToday(ctx);
-			}
-		}, 60_000);
-	}
-
-	function stopRefresh() {
-		if (refreshTimer) {
-			clearInterval(refreshTimer);
-			refreshTimer = null;
-		}
-	}
-
 	// ── Events ──
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async () => {
 		apiKey = getApiKey();
+		publishToday(pi, null);
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!apiKey) {
+			apiKey = getApiKey();
+		}
 		if (!apiKey) {
 			publishToday(pi, null);
 			return;
 		}
-		startRefresh(ctx);
+
+		if (widgetVisible) {
+			await refreshAll(ctx);
+		} else {
+			await refreshToday(ctx);
+		}
 	});
 
 	pi.on("session_shutdown", async () => {
-		stopRefresh();
+		publishToday(pi, null);
 	});
 
 	// ── Command ──
@@ -342,9 +334,9 @@ export default function (pi: ExtensionAPI) {
 			widgetVisible = !widgetVisible;
 
 			if (widgetVisible) {
-				await refreshAll(ctx);
+				updateWidget(ctx);
 				ctx.ui.notify(
-					`WakaTime widget shown — ${lastMulti ? buildNotificationLines(lastMulti) : "?"}`,
+					`WakaTime widget shown — ${lastMulti ? buildNotificationLines(lastMulti) : "updates after next agent call"}`,
 					"info",
 				);
 			} else {
