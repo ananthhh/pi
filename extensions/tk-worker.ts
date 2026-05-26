@@ -158,6 +158,10 @@ async function queryTickets(pi: ExtensionAPI, cwd: string): Promise<TicketInfo[]
 	return tickets;
 }
 
+function isOwnedByArchitect(t: TicketInfo): boolean {
+	return t.tags.includes("by_architect") || t.tags.includes("architect_planning");
+}
+
 async function findWorkerEpic(pi: ExtensionAPI, cwd: string): Promise<TicketInfo | undefined> {
 	const all = await queryTickets(pi, cwd);
 	const candidates = all.filter((t) => t.status === "in_progress" && t.tags.includes(WORKER_TAG));
@@ -177,6 +181,11 @@ async function findWorkerEpic(pi: ExtensionAPI, cwd: string): Promise<TicketInfo
 	}
 
 	return undefined;
+}
+
+async function findAvailableEpics(pi: ExtensionAPI, cwd: string): Promise<TicketInfo[]> {
+	const all = await queryTickets(pi, cwd);
+	return all.filter((t) => !isOwnedByArchitect(t) && (t.status === "open" || t.status === "in_progress"));
 }
 
 function phaseLabel(tags: string[]): string {
@@ -406,10 +415,17 @@ export default function (pi: ExtensionAPI) {
 			const base = await defaultBranch(pi, ctx.cwd);
 
 			if (currentBranch === base) {
-				// On main: show ready epics
-				const ready = await tk(pi, ctx.cwd, ["ready", "-T", "epic"]).catch((e) => ({ code: 1, stdout: "", stderr: String(e) } as ExecResult));
-				const text = ready.code === 0 ? (ready.stdout ?? "No ready epics.") : `Error listing epics: ${resultText(ready)}`;
-				return { content: [{ type: "text", text: `On ${base}. Ready epics:\n${text}` }] };
+				// On main: show all open + in_progress epics available to workers
+				const available = await findAvailableEpics(pi, ctx.cwd);
+				let text: string;
+				if (available.length === 0) {
+					text = "No open or in-progress epics available for workers.";
+				} else {
+					text = available
+						.map((t) => `  ${t.id} [${t.status}] ${t.title}`)
+						.join("\n");
+				}
+				return { content: [{ type: "text", text: `On ${base}. Available epics:\n${text}` }] };
 			}
 
 			// On feature branch: show active epic
@@ -448,26 +464,24 @@ export default function (pi: ExtensionAPI) {
 			try {
 				let epic = await findWorkerEpic(pi, ctx.cwd);
 
-				// No active epic: try to find or create one
+				// No active epic: show available epics or create new
 				if (!epic) {
-					const all = await queryTickets(pi, ctx.cwd);
-					const inProgress = all.filter((t) => t.status === "in_progress" && t.tags.includes(WORKER_TAG));
+					const available = await findAvailableEpics(pi, ctx.cwd);
 
-					if (inProgress.length > 0 && ctx.hasUI) {
+					if (available.length > 0 && ctx.hasUI) {
 						const choices = [
-							...inProgress.map((t) => `${t.id} — ${t.title}`),
+							...available.map((t) => `${t.id} [${t.status}] — ${t.title}`),
 							"Start a new epic",
 						];
-						const choice = await ctx.ui.select("Choose an in-progress epic or start new:", choices);
+						const choice = await ctx.ui.select("Choose an epic to work on or start new:", choices);
 						if (!choice) throw new Error("No epic selected.");
 
 						if (choice === "Start a new epic") {
-							// Fall through to create new
+							/* fall through to create new */
 						} else {
-							const id = choice.split(" — ")[0];
-							epic = all.find((t) => t.id === id);
+							const id = choice.split(" ")[0];
+							epic = available.find((t) => t.id === id);
 							if (!epic) throw new Error("Selected epic not found.");
-							if (!epic.tags.includes(WORKER_TAG)) throw new Error(`Epic ${epic.id} is not a worker epic.`);
 						}
 					}
 
@@ -512,6 +526,57 @@ export default function (pi: ExtensionAPI) {
 						pi.sendUserMessage(goal);
 						return;
 					}
+
+					// User selected an existing epic: start it
+					if (epic.status === "open") {
+						await updateTicketStatus(pi, ctx.cwd, epic.id, "in_progress");
+						await updateTicketTags(pi, ctx.cwd, epic.id, [WORKER_TAG, "agent_work"], []);
+					}
+					if (!epic.tags.includes(WORKER_TAG)) {
+						await updateTicketTags(pi, ctx.cwd, epic.id, [WORKER_TAG, "agent_work"], []);
+					}
+					if (!epic.tags.includes("agent_work")) {
+						await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], []);
+					}
+
+					if (!(await gitOk(pi, ctx.cwd, ["rev-parse", "--is-inside-work-tree"]))) {
+						throw new Error("Not inside a git worktree.");
+					}
+					await requireClean(pi, ctx.cwd, "start");
+
+					const base = await defaultBranch(pi, ctx.cwd);
+					const currentBranch = await gitOutput(pi, ctx.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+
+					if (currentBranch !== base) {
+						const proceed = await ctx.ui.confirm(
+							"Not on default branch",
+							`You are on ${currentBranch}, not the default branch (${base}). The epic branch will be created from ${currentBranch}. Proceed?`,
+						);
+						if (!proceed) throw new Error("Start cancelled");
+					}
+
+					// Check if branch already exists
+					const epicBranch = `epic/${epic.id}-${slugify(branchTitle(epic.title))}`;
+					const branchExists = await gitOk(pi, ctx.cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${epicBranch}`]);
+					if (branchExists) {
+						await git(pi, ctx.cwd, ["checkout", epicBranch]);
+					} else {
+						const checkout = await git(pi, ctx.cwd, ["checkout", "-b", epicBranch]);
+						if (checkout.code !== 0) throw new Error(resultText(checkout));
+					}
+
+					await commitAll(pi, ctx.cwd, "PI: Init");
+
+					// Reload epic info after tag changes
+					const all2 = await queryTickets(pi, ctx.cwd);
+					const refreshed = all2.find((t) => t.id === epic.id);
+					if (refreshed) epic = refreshed;
+
+					ctx.ui.setStatus("tk-worker", `worker: agent work`);
+					ctx.ui.notify(`Worker epic ${epic.id} started on ${epicBranch}.`, "info");
+
+					pi.sendUserMessage(`Start working on epic: ${epic.title}`);
+					return;
 				}
 
 				if (!epic) throw new Error("No active tk-worker epic found.");
