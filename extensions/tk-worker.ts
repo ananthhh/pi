@@ -304,8 +304,8 @@ export default function (pi: ExtensionAPI) {
 			const summary = String(params.summary ?? "").trim();
 			if (!summary) throw new Error("summary is required.");
 
-			const commit = await commitAll(pi, ctx.cwd, `agent: ${summary}`);
 			await updateTicketTags(pi, ctx.cwd, epic.id, ["human_review"], PHASE_TAGS.filter((t) => t !== "human_review"));
+			const commit = await commitAll(pi, ctx.cwd, `agent: ${summary}`);
 
 			ctx.ui.setStatus("tk-worker", `worker: human review`);
 			return {
@@ -341,6 +341,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (currentBranch === base) throw new Error(`Already on ${base}. Cannot finalize from default branch.`);
 
+			// Include final ticket metadata in the squashed commit.
+			await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
+			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
+			await commitAll(pi, ctx.cwd, "agent: finalize ticket metadata");
+
 			// Rebase onto base branch
 			const rebase = await git(pi, ctx.cwd, ["rebase", base], 120_000);
 			if (rebase.code !== 0) {
@@ -355,8 +360,6 @@ export default function (pi: ExtensionAPI) {
 			if (await gitOk(pi, ctx.cwd, ["diff", "--cached", "--quiet"])) {
 				// No changes
 				await git(pi, ctx.cwd, ["checkout", base]);
-				await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
-				await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
 				ctx.ui.setStatus("tk-worker", undefined);
 				return {
 					content: [{ type: "text", text: "No changes to finalize. Epic closed. Session ended." }],
@@ -378,10 +381,6 @@ export default function (pi: ExtensionAPI) {
 				await git(pi, ctx.cwd, ["checkout", currentBranch]);
 				throw new Error(`Fast-forward merge to ${base} failed: ${resultText(merge)}`);
 			}
-
-			// Close epic and clean up tags
-			await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
-			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
 
 			// Ask to delete branch
 			let deleted = false;
@@ -528,17 +527,6 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					// User selected an existing epic: start it
-					if (epic.status === "open") {
-						await updateTicketStatus(pi, ctx.cwd, epic.id, "in_progress");
-						await updateTicketTags(pi, ctx.cwd, epic.id, [WORKER_TAG, "agent_work"], []);
-					}
-					if (!epic.tags.includes(WORKER_TAG)) {
-						await updateTicketTags(pi, ctx.cwd, epic.id, [WORKER_TAG, "agent_work"], []);
-					}
-					if (!epic.tags.includes("agent_work")) {
-						await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], []);
-					}
-
 					if (!(await gitOk(pi, ctx.cwd, ["rev-parse", "--is-inside-work-tree"]))) {
 						throw new Error("Not inside a git worktree.");
 					}
@@ -559,11 +547,17 @@ export default function (pi: ExtensionAPI) {
 					const epicBranch = `epic/${epic.id}-${slugify(branchTitle(epic.title))}`;
 					const branchExists = await gitOk(pi, ctx.cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${epicBranch}`]);
 					if (branchExists) {
-						await git(pi, ctx.cwd, ["checkout", epicBranch]);
+						const checkout = await git(pi, ctx.cwd, ["checkout", epicBranch]);
+						if (checkout.code !== 0) throw new Error(resultText(checkout));
 					} else {
 						const checkout = await git(pi, ctx.cwd, ["checkout", "-b", epicBranch]);
 						if (checkout.code !== 0) throw new Error(resultText(checkout));
 					}
+
+					if (epic.status === "open") {
+						await updateTicketStatus(pi, ctx.cwd, epic.id, "in_progress");
+					}
+					await updateTicketTags(pi, ctx.cwd, epic.id, [WORKER_TAG, "agent_work"], []);
 
 					await commitAll(pi, ctx.cwd, "PI: Init");
 
@@ -587,36 +581,21 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (epic.tags.includes("human_review")) {
-					const dirty = await gitOutput(pi, ctx.cwd, ["status", "--porcelain"]);
-					if (!dirty && ctx.hasUI) {
-						const proceed = await ctx.ui.confirm("No changes detected", "You have no uncommitted changes. Send back to agent anyway?");
-						if (!proceed) return;
-					}
-					await commitAll(pi, ctx.cwd, "human: review changes");
-
-					if (!ctx.hasUI) {
-						await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], PHASE_TAGS.filter((t) => t !== "agent_work"));
-						ctx.ui.setStatus("tk-worker", `worker: agent work`);
-						const diff = await latestHumanDiff(pi, ctx.cwd);
-						pi.sendUserMessage(
-							[
-								"Human review complete. Updates are needed.",
-								"",
-								"The diff below shows only the human's changes since the last agent handoff.",
-								"",
-								diff,
-							].join("\n"),
-						);
-						return;
-					}
-
-					const needsUpdates = await ctx.ui.confirm(
-						"Review agent work",
-						"Do you need to make updates or leave review comments for the agent?\n\n• Yes: Changes will be committed and sent back to agent.\n• No: Finalize and merge the work.",
-					);
+					const needsUpdates = ctx.hasUI
+						? await ctx.ui.confirm(
+							"Review agent work",
+							"Do you need to make updates or leave review comments for the agent?\n\n• Yes: Changes will be committed and sent back to agent.\n• No: Finalize and merge the work.",
+						)
+						: true;
 
 					if (needsUpdates) {
+						const dirty = await gitOutput(pi, ctx.cwd, ["status", "--porcelain"]);
+						if (!dirty && ctx.hasUI) {
+							const proceed = await ctx.ui.confirm("No changes detected", "You have no uncommitted changes. Send back to agent anyway?");
+							if (!proceed) return;
+						}
 						await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], PHASE_TAGS.filter((t) => t !== "agent_work"));
+						await commitAll(pi, ctx.cwd, "human: review changes");
 						ctx.ui.setStatus("tk-worker", `worker: agent work`);
 						ctx.ui.notify("Human changes committed. Sending back to agent.", "info");
 						const diff = await latestHumanDiff(pi, ctx.cwd);
@@ -636,6 +615,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					} else {
 						await updateTicketTags(pi, ctx.cwd, epic.id, ["final_approved"], PHASE_TAGS.filter((t) => t !== "final_approved"));
+						await commitAll(pi, ctx.cwd, "human: final approval");
 						ctx.ui.setStatus("tk-worker", `worker: final approved`);
 						pi.sendUserMessage(
 							[
