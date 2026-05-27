@@ -269,6 +269,8 @@ export default function (pi: ExtensionAPI) {
 		if (epic.tags.includes("agent_work")) {
 			guidance += [
 				"\nYou may edit any .tickets/*.md file and run tk commands (create, dep, status, etc.) to build the architecture.",
+				`Create child tickets with both parent and epic tag: tk create \"<title>\" --parent ${epic.id} --tags epic-${epic.id}`,
+				"Add dependencies with tk dep <id> <depends-on-id>.",
 				"Do not edit implementation source files outside .tickets/.",
 				"When the plan is complete, call tk_architect_agent_done with a summary.",
 			].join("\n");

@@ -40,7 +40,7 @@ The `tk-architect` extension manages the pair-program workflow:
 In one session, you should:
 
 1. Fill out the epic markdown file with: Problem/Goal, Scope, Non-Goals, Child Ticket Plan, Dependency Plan, Open Questions
-2. Create child tickets using `tk create <title> --parent <epic-id>`
+2. Create child tickets using `tk create <title> --parent <epic-id> --tags epic-<epic-id>`
 3. Add dependencies between tickets using `tk dep <id> <depends-on-id>`
 4. Fill out child ticket markdowns with: Research, Design, Acceptance Criteria, Notes/Risks
 

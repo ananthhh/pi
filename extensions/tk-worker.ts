@@ -4,11 +4,14 @@ import { resolve } from "node:path";
 
 type ExecResult = { stdout?: string; stderr?: string; code: number; killed?: boolean };
 
-type TicketInfo = { id: string; title: string; status: string; tags: string[]; path: string };
+type TicketInfo = { id: string; title: string; status: string; tags: string[]; type: string; parent?: string; deps: string[]; path: string };
 
 const WORKER_TOOLS = new Set(["tk_worker_agent_done", "tk_worker_finalize", "tk_status"]);
 const GUARDED_TOOLS = new Set(["bash", "read", "edit", "write"]);
 const WORKER_TAG = "by_worker";
+const YOLO_TAG = "yolo";
+const FOCUSED_TAG = "focused";
+const MODE_TAGS = [YOLO_TAG, FOCUSED_TAG];
 const PHASE_TAGS = ["agent_work", "human_review", "final_approved"];
 
 /* ─── Git helpers ─── */
@@ -142,13 +145,15 @@ async function queryTickets(pi: ExtensionAPI, cwd: string): Promise<TicketInfo[]
 	for (const line of lines) {
 		try {
 			const data = JSON.parse(line);
-			if (data.type !== "epic") continue;
 			const title = await getTicketTitle(pi, cwd, data.id);
 			tickets.push({
 				id: data.id,
 				title,
 				status: data.status ?? "open",
 				tags: Array.isArray(data.tags) ? data.tags : [],
+				type: data.type ?? "task",
+				parent: data.parent,
+				deps: Array.isArray(data.deps) ? data.deps : [],
 				path: "",
 			});
 		} catch {
@@ -164,7 +169,7 @@ function isOwnedByArchitect(t: TicketInfo): boolean {
 
 async function findWorkerEpic(pi: ExtensionAPI, cwd: string): Promise<TicketInfo | undefined> {
 	const all = await queryTickets(pi, cwd);
-	const candidates = all.filter((t) => t.status === "in_progress" && t.tags.includes(WORKER_TAG));
+	const candidates = all.filter((t) => t.type === "epic" && t.status === "in_progress" && t.tags.includes(WORKER_TAG));
 	if (candidates.length === 1) return candidates[0];
 
 	// Fallback: check branch name
@@ -185,7 +190,59 @@ async function findWorkerEpic(pi: ExtensionAPI, cwd: string): Promise<TicketInfo
 
 async function findAvailableEpics(pi: ExtensionAPI, cwd: string): Promise<TicketInfo[]> {
 	const all = await queryTickets(pi, cwd);
-	return all.filter((t) => !isOwnedByArchitect(t) && (t.status === "open" || t.status === "in_progress"));
+	return all.filter((t) => t.type === "epic" && !isOwnedByArchitect(t) && (t.status === "open" || t.status === "in_progress"));
+}
+
+function epicTag(epicId: string): string {
+	return `epic-${epicId}`;
+}
+
+function modeLabel(tags: string[]): "yolo" | "focused" | "unset" {
+	if (tags.includes(YOLO_TAG)) return "yolo";
+	if (tags.includes(FOCUSED_TAG)) return "focused";
+	return "unset";
+}
+
+function childTicketsForEpic(all: TicketInfo[], epicId: string): TicketInfo[] {
+	return all.filter((t) => t.type !== "epic" && (t.parent === epicId || t.tags.includes(epicTag(epicId))));
+}
+
+function readyChildren(all: TicketInfo[], epicId: string): TicketInfo[] {
+	const byId = new Map(all.map((t) => [t.id, t]));
+	return childTicketsForEpic(all, epicId).filter((t) => {
+		if (t.status === "closed") return false;
+		return t.deps.every((depId) => byId.get(depId)?.status === "closed");
+	});
+}
+
+function activeFocusedChild(all: TicketInfo[], epicId: string): TicketInfo | undefined {
+	return childTicketsForEpic(all, epicId).find((t) => t.status === "in_progress");
+}
+
+async function chooseFocusedChild(ctx: any, all: TicketInfo[], epic: TicketInfo): Promise<TicketInfo | undefined> {
+	const active = activeFocusedChild(all, epic.id);
+	if (active) return active;
+	const ready = readyChildren(all, epic.id);
+	if (ready.length === 0) return undefined;
+	if (ready.length === 1 || !ctx.hasUI) return ready[0];
+	const choice = await ctx.ui.select(
+		"Choose ready child ticket to work on:",
+		ready.map((t) => `${t.id} — ${t.title}`),
+	);
+	if (!choice) return undefined;
+	return ready.find((t) => t.id === choice.split(" — ")[0]);
+}
+
+async function chooseMode(ctx: any, childCount: number): Promise<"yolo" | "focused"> {
+	if (childCount === 0) return "yolo";
+	if (childCount === 1) return "focused";
+	if (!ctx.hasUI) return "focused";
+	const choice = await ctx.ui.select("Choose worker mode for this epic:", [
+		"focused — work one ready child ticket at a time",
+		"yolo — work the whole epic at once",
+	]);
+	if (!choice) throw new Error("No worker mode selected.");
+	return choice.startsWith("yolo") ? "yolo" : "focused";
 }
 
 function phaseLabel(tags: string[]): string {
@@ -243,10 +300,13 @@ export default function (pi: ExtensionAPI) {
 		if (!epic || !epic.tags.includes(WORKER_TAG)) return undefined;
 
 		let guidance = `TK Worker extension is active. Epic: ${epic.id} — ${epic.title}.`;
-		guidance += `\nCurrent phase: ${phaseLabel(epic.tags)}.`;
+		guidance += `\nCurrent phase: ${phaseLabel(epic.tags)}. Mode: ${modeLabel(epic.tags)}.`;
+		const allTickets = await queryTickets(pi, ctx.cwd).catch(() => []);
+		const child = epic.tags.includes(FOCUSED_TAG) ? activeFocusedChild(allTickets, epic.id) : undefined;
+		if (child) guidance += `\nFocused child ticket: ${child.id} — ${child.title}. Work only this child ticket's scope.`;
 
 		if (epic.tags.includes("agent_work")) {
-			guidance += "\nImplement the goal. When done, call tk_worker_agent_done with a concise summary.";
+			guidance += "\nImplement the assigned scope. When done, call tk_worker_agent_done with a concise summary.";
 		} else if (epic.tags.includes("human_review")) {
 			guidance += "\nHuman review is active. Do not use file/git tools; wait for the human to run /tk-worker to continue.";
 		} else if (epic.tags.includes("final_approved")) {
@@ -341,7 +401,31 @@ export default function (pi: ExtensionAPI) {
 
 			if (currentBranch === base) throw new Error(`Already on ${base}. Cannot finalize from default branch.`);
 
+			// Focused mode finalizes one child at a time on the same branch.
+			if (epic.tags.includes(FOCUSED_TAG)) {
+				const all = await queryTickets(pi, ctx.cwd);
+				const child = activeFocusedChild(all, epic.id);
+				if (!child) throw new Error(`No active focused child ticket found for epic ${epic.id}.`);
+				await updateTicketStatus(pi, ctx.cwd, child.id, "closed");
+				const remaining = childTicketsForEpic(all, epic.id).filter((t) => t.id !== child.id && t.status !== "closed");
+				if (remaining.length > 0) {
+					await updateTicketTags(pi, ctx.cwd, epic.id, [], PHASE_TAGS);
+					await commitAll(pi, ctx.cwd, `agent: close child ${child.id}`);
+					ctx.ui.setStatus("tk-worker", undefined);
+					return {
+						content: [{ type: "text", text: `Closed child ${child.id}. ${remaining.length} child ticket(s) remain. Run /tk-worker to choose the next ready child.` }],
+						terminate: true,
+					};
+				}
+			}
+
 			// Include final ticket metadata in the squashed commit.
+			if (epic.tags.includes(YOLO_TAG)) {
+				const all = await queryTickets(pi, ctx.cwd);
+				for (const child of childTicketsForEpic(all, epic.id).filter((t) => t.status !== "closed")) {
+					await updateTicketStatus(pi, ctx.cwd, child.id, "closed");
+				}
+			}
 			await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
 			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
 			await commitAll(pi, ctx.cwd, "agent: finalize ticket metadata");
@@ -505,7 +589,7 @@ export default function (pi: ExtensionAPI) {
 							if (!proceed) throw new Error("Start cancelled");
 						}
 
-						const epicId = await tkOutput(pi, ctx.cwd, ["create", goal, "--type", "epic", "--tags", [WORKER_TAG, "agent_work"].join(",")]);
+						const epicId = await tkOutput(pi, ctx.cwd, ["create", goal, "--type", "epic", "--tags", [WORKER_TAG, "agent_work", YOLO_TAG].join(",")]);
 						await tk(pi, ctx.cwd, ["start", epicId]);
 
 						const epicBranch = `epic/${epicId}-${slugify(branchTitle(goal))}`;
@@ -557,7 +641,21 @@ export default function (pi: ExtensionAPI) {
 					if (epic.status === "open") {
 						await updateTicketStatus(pi, ctx.cwd, epic.id, "in_progress");
 					}
-					await updateTicketTags(pi, ctx.cwd, epic.id, [WORKER_TAG, "agent_work"], []);
+
+					const allBeforeMode = await queryTickets(pi, ctx.cwd);
+					const children = childTicketsForEpic(allBeforeMode, epic.id);
+					const mode = modeLabel(epic.tags) === "unset" ? await chooseMode(ctx, children.length) : modeLabel(epic.tags);
+					const addTags = [WORKER_TAG, "agent_work", mode === "focused" ? FOCUSED_TAG : YOLO_TAG];
+					const removeTags = mode === "focused" ? [YOLO_TAG] : [FOCUSED_TAG];
+					await updateTicketTags(pi, ctx.cwd, epic.id, addTags, removeTags);
+
+					let child: TicketInfo | undefined;
+					if (mode === "focused") {
+						const allForChild = await queryTickets(pi, ctx.cwd);
+						child = await chooseFocusedChild(ctx, allForChild, { ...epic, tags: [...epic.tags, FOCUSED_TAG] });
+						if (!child) throw new Error(`No ready child tickets for focused epic ${epic.id}.`);
+						if (child.status === "open") await updateTicketStatus(pi, ctx.cwd, child.id, "in_progress");
+					}
 
 					await commitAll(pi, ctx.cwd, "PI: Init");
 
@@ -569,11 +667,25 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.setStatus("tk-worker", `worker: agent work`);
 					ctx.ui.notify(`Worker epic ${epic.id} started on ${epicBranch}.`, "info");
 
-					pi.sendUserMessage(`Start working on epic: ${epic.title}`);
+					pi.sendUserMessage(child ? `Start working on child ticket ${child.id}: ${child.title}` : `Start working on epic: ${epic.title}`);
 					return;
 				}
 
 				if (!epic) throw new Error("No active tk-worker epic found.");
+
+				// Focused mode may pause between child tickets with no active phase tag.
+				if (epic.tags.includes(FOCUSED_TAG) && !PHASE_TAGS.some((tag) => epic.tags.includes(tag))) {
+					await requireClean(pi, ctx.cwd, "start next focused child");
+					const all = await queryTickets(pi, ctx.cwd);
+					const child = await chooseFocusedChild(ctx, all, epic);
+					if (!child) throw new Error(`No ready child tickets for focused epic ${epic.id}.`);
+					if (child.status === "open") await updateTicketStatus(pi, ctx.cwd, child.id, "in_progress");
+					await updateTicketTags(pi, ctx.cwd, epic.id, ["agent_work"], []);
+					await commitAll(pi, ctx.cwd, `human: start child ${child.id}`);
+					ctx.ui.setStatus("tk-worker", `worker: agent work`);
+					pi.sendUserMessage(`Start working on child ticket ${child.id}: ${child.title}`);
+					return;
+				}
 
 				// Continue existing epic based on phase
 				if (epic.tags.includes("agent_work")) {

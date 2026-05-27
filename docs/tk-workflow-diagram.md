@@ -97,8 +97,13 @@
   ┌─────────────────────────────┐
   │ Start the epic:             │
   │ status: in_progress         │
-  │ tags: by_worker, agent_work   │
+  │ tags: by_worker, agent_work │
+  │       + yolo/focused        │
   │ Create branch, "PI: Init"   │
+  │                             │
+  │ yolo: work whole epic       │
+  │ focused: choose one ready   │
+  │ child via epic-<epic-id>    │
   └─────────────────────────────┘
          │
          ▼
@@ -157,10 +162,14 @@
     After finalize:    (none)  ← status: open
 
   WORKER TAGS:
-    Creating:          by_worker + agent_work
-    Human review:      by_worker + human_review
-    Final approved:    by_worker + final_approved
-    After finalize:    (none)  ← status: closed
+    Creating:          by_worker + agent_work + yolo/focused
+    Human review:      by_worker + human_review + yolo/focused
+    Final approved:    by_worker + final_approved + yolo/focused
+    After finalize:    yolo/focused  ← status: closed
+
+  WORKER MODES:
+    yolo:              work whole epic at once; closes epic and all children
+    focused:           work one ready child at a time; keeps same branch until all children closed
 
   ARCHITECT GUARD:
     • Blocks: edit/write outside .tickets/
