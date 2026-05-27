@@ -379,7 +379,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Include final ticket metadata in the squashed commit.
 			await updateTicketStatus(pi, ctx.cwd, epic.id, "open");
-			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, ARCHITECT_TAG, PLANNING_TAG]);
+			await updateTicketTags(pi, ctx.cwd, epic.id, [], [...PHASE_TAGS, ARCHITECT_TAG, PLANNING_TAG]);
 			await commitAll(pi, ctx.cwd, "agent: finalize architecture metadata");
 
 			// Rebase onto base branch

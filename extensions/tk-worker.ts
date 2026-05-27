@@ -427,7 +427,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			await updateTicketStatus(pi, ctx.cwd, epic.id, "closed");
-			await updateTicketTags(pi, ctx.cwd, [], [...PHASE_TAGS, WORKER_TAG]);
+			await updateTicketTags(pi, ctx.cwd, epic.id, [], [...PHASE_TAGS, WORKER_TAG]);
 			await commitAll(pi, ctx.cwd, "agent: finalize ticket metadata");
 
 			// Rebase onto base branch
