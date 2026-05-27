@@ -270,7 +270,7 @@ function branchTitle(goal: string): string {
 
 async function latestHumanDiff(pi: ExtensionAPI, cwd: string): Promise<string> {
 	const nameStatus = await gitOutput(pi, cwd, ["diff", "HEAD~1", "HEAD", "--name-status"]);
-	const diff = await gitOutput(pi, cwd, ["diff", "HEAD~1", "HEAD", "--unified=80"], 120_000);
+	const diff = await gitOutput(pi, cwd, ["diff", "HEAD~1", "HEAD", "--unified=10"], 120_000);
 	return [
 		"Changes since last agent handoff:",
 		"```text",
