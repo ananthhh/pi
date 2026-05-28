@@ -13,6 +13,23 @@ Planning mode for the `tk` ticket system. Build architecture in one session usin
 - List epics with: `tk ls --status=in_progress -T by_architect`.
 - Read an epic/ticket with: `tk show <id>`.
 
+## Guarded Command Rules
+
+During `agent_work`, bash is intentionally restricted. Allowed bash commands are:
+
+- Any command starting with `tk `
+- Read-only git: `git status`, `git log`, `git show`, `git diff`, `git ls-files`
+- Read-only exploration: `pwd`, `ls`, `rg`, `grep`, `find`
+
+Important: the guard blocks shell metacharacters anywhere in the command string, even inside quotes: `;`, `&`, `|`, backticks, `$`, `<`, `>`.
+
+Examples that will be blocked:
+
+- `tk query '.[] | select(.parent=="epic-id")'` — blocked because of `|` inside the quoted query
+- `find . -name '*.test.ts' -print | head -80` — blocked because of the pipe and because `head` is not allowed
+
+Avoid pipes and command substitutions. Run a single allowed command directly, then inspect the returned output.
+
 ## Starting an Architecture Session
 
 When explicitly asked to plan an epic:

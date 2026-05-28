@@ -281,14 +281,15 @@ export default function (pi: ExtensionAPI) {
 		publishToday(pi, result);
 	}
 
-	async function refreshAll(ctx: ExtensionContext) {
-		if (!apiKey) return;
+	async function refreshAll(ctx: ExtensionContext): Promise<boolean> {
+		if (!apiKey) return false;
 		const multi = await fetchMultiRange(apiKey);
-		if (!multi) return;
+		if (!multi) return false;
 		lastMulti = multi;
 		lastToday = multi.today;
 		publishToday(pi, multi.today);
 		updateWidget(ctx);
+		return true;
 	}
 
 	// ── Events ──
@@ -334,9 +335,15 @@ export default function (pi: ExtensionAPI) {
 			widgetVisible = !widgetVisible;
 
 			if (widgetVisible) {
-				updateWidget(ctx);
+				if (lastMulti) {
+					updateWidget(ctx);
+				} else if (ctx.hasUI) {
+					ctx.ui.setWidget("wakatime", ["Fetching WakaTime data…"]);
+				}
+
+				const refreshed = await refreshAll(ctx);
 				ctx.ui.notify(
-					`WakaTime widget shown — ${lastMulti ? buildNotificationLines(lastMulti) : "updates after next agent call"}`,
+					`WakaTime widget shown — ${lastMulti ? buildNotificationLines(lastMulti) : "unable to fetch data"}${refreshed ? "" : lastMulti ? " (cached)" : ""}`,
 					"info",
 				);
 			} else {
