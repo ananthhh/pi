@@ -693,12 +693,15 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (epic.tags.includes("human_review")) {
-					const needsUpdates = ctx.hasUI
-						? await ctx.ui.confirm(
-							"Review agent work",
-							"Do you need to make updates or leave review comments for the agent?\n\n• Yes: Changes will be committed and sent back to agent.\n• No: Finalize and merge the work.",
-						)
-						: true;
+					let needsUpdates = true;
+					if (ctx.hasUI) {
+						const choice = await ctx.ui.select("Review agent work", [
+							"Updates Needed — commit review changes and send back to agent",
+							"Final Approve — approve and ask agent to finalize",
+						]);
+						if (!choice) return;
+						needsUpdates = choice.startsWith("Updates Needed");
+					}
 
 					if (needsUpdates) {
 						const dirty = await gitOutput(pi, ctx.cwd, ["status", "--porcelain"]);
